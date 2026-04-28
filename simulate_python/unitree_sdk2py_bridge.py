@@ -4,16 +4,16 @@ import pygame
 import sys
 import struct
 
-from unitree_sdk2py.core.channel import ChannelSubscriber, ChannelPublisher
+from unitree_sdk2py.core.channel import ChannelSubscriber, ChannelPublisher#订阅与发布
 
-from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
-from unitree_sdk2py.idl.unitree_go.msg.dds_ import WirelessController_
+from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_#导航仪/高度计
+from unitree_sdk2py.idl.unitree_go.msg.dds_ import WirelessController_#手柄指令
 from unitree_sdk2py.idl.default import unitree_go_msg_dds__SportModeState_
 from unitree_sdk2py.idl.default import unitree_go_msg_dds__WirelessController_
-from unitree_sdk2py.utils.thread import RecurrentThread
+from unitree_sdk2py.utils.thread import RecurrentThread#周期性线程。通讯以固定的频率稳定运行。
 
 import config
-if config.ROBOT=="g1":
+if config.ROBOT=="g1":#人形用high grade
     from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_
     from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
     from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowState_ as LowState_default
@@ -22,14 +22,14 @@ else:
     from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowState_
     from unitree_sdk2py.idl.default import unitree_go_msg_dds__LowState_ as LowState_default
 
-TOPIC_LOWCMD = "rt/lowcmd"
-TOPIC_LOWSTATE = "rt/lowstate"
+TOPIC_LOWCMD = "rt/lowcmd"# 算法给机器人发指令的“频道”。rt代表real time
+TOPIC_LOWSTATE = "rt/lowstate"# 机器人给算法回状态的“频道”
 TOPIC_HIGHSTATE = "rt/sportmodestate"
 TOPIC_WIRELESS_CONTROLLER = "rt/wirelesscontroller"
 
 MOTOR_SENSOR_NUM = 3
 NUM_MOTOR_IDL_GO = 20
-NUM_MOTOR_IDL_HG = 35
+NUM_MOTOR_IDL_HG = 35#宇树在定义 G1 的数据包时，预留了最多 35 个电机的坑位。
 
 class UnitreeSdk2Bridge:
 
@@ -37,34 +37,38 @@ class UnitreeSdk2Bridge:
         self.mj_model = mj_model
         self.mj_data = mj_data
 
-        self.num_motor = self.mj_model.nu
-        self.dim_motor_sensor = MOTOR_SENSOR_NUM * self.num_motor
+        self.num_motor = self.mj_model.nu#获取电机数量
+        self.dim_motor_sensor = MOTOR_SENSOR_NUM * self.num_motor#维度*电机数量
         self.have_imu = False
         self.have_frame_sensor = False
-        self.dt = self.mj_model.opt.timestep
+        self.dt = self.mj_model.opt.timestep#同步时间步长。保证“算一次物理，发一次数据”
         self.idl_type = (self.num_motor > NUM_MOTOR_IDL_GO) # 0: unitree_go, 1: unitree_hg
 
         self.joystick = None
 
         # Check sensor
-        for i in range(self.dim_motor_sensor, self.mj_model.nsensor):
+        for i in range(self.dim_motor_sensor, self.mj_model.nsensor):#从电机传感器的位置开始一直到最后一个传感器
             name = mujoco.mj_id2name(
                 self.mj_model, mujoco._enums.mjtObj.mjOBJ_SENSOR, i
-            )
+            )#获取编号为i的传感器在XML文件中的名字
             if name == "imu_quat":
                 self.have_imu_ = True
             if name == "frame_pos":
-                self.have_frame_sensor_ = True
+                self.have_frame_sensor_ = True #身体位姿数据转发开关
 
         # Unitree sdk2 message
-        self.low_state = LowState_default()
-        self.low_state_puber = ChannelPublisher(TOPIC_LOWSTATE, LowState_)
+        #1.低层状态广播
+        #它不断调用 PublishLowState 函数，把 MuJoCo 里的物理数值填进 SDK 的表格里并发出去。
+        self.low_state = LowState_default()# 创建空白状态表
+        self.low_state_puber = ChannelPublisher(TOPIC_LOWSTATE, LowState_)#准备好发射台
         self.low_state_puber.Init()
         self.lowStateThread = RecurrentThread(
             interval=self.dt, target=self.PublishLowState, name="sim_lowstate"
         )
         self.lowStateThread.Start()
 
+        #2.运动状态广播
+        #汇报机器人的整体运动表现。当前坐标行动速度等。
         self.high_state = unitree_go_msg_dds__SportModeState_()
         self.high_state_puber = ChannelPublisher(TOPIC_HIGHSTATE, SportModeState_)
         self.high_state_puber.Init()
@@ -73,6 +77,7 @@ class UnitreeSdk2Bridge:
         )
         self.HighStateThread.Start()
 
+        #3.遥控器广播
         self.wireless_controller = unitree_go_msg_dds__WirelessController_()
         self.wireless_controller_puber = ChannelPublisher(
             TOPIC_WIRELESS_CONTROLLER, WirelessController_
@@ -85,11 +90,13 @@ class UnitreeSdk2Bridge:
         )
         self.WirelessControllerThread.Start()
 
+        #4. 指令接收订阅
+        # 订阅了算法发来的控制指令（rt/lowcmd）
         self.low_cmd_suber = ChannelSubscriber(TOPIC_LOWCMD, LowCmd_)
-        self.low_cmd_suber.Init(self.LowCmdHandler, 10)
+        self.low_cmd_suber.Init(self.LowCmdHandler, 10)#指令过来，去执行LowCmdHandler这个函数
 
         # joystick
-        self.key_map = {
+        self.key_map = {#用16 个二进制位表示
             "R1": 0,
             "L1": 1,
             "start": 2,
@@ -107,34 +114,36 @@ class UnitreeSdk2Bridge:
             "down": 14,
             "left": 15,
         }
-
-    def LowCmdHandler(self, msg: LowCmd_):
+    
+    #把控制算法发来的“数字指令”，转化成 MuJoCo 物理引擎里的“真实力矩”。
+    def LowCmdHandler(self, msg: LowCmd_):#传入的是数据包
         if self.mj_data != None:
             for i in range(self.num_motor):
                 self.mj_data.ctrl[i] = (
-                    msg.motor_cmd[i].tau
+                    msg.motor_cmd[i].tau#前馈力矩
                     + msg.motor_cmd[i].kp
-                    * (msg.motor_cmd[i].q - self.mj_data.sensordata[i])
+                    * (msg.motor_cmd[i].q - self.mj_data.sensordata[i])#期望的-当前的
                     + msg.motor_cmd[i].kd
                     * (
                         msg.motor_cmd[i].dq
-                        - self.mj_data.sensordata[i + self.num_motor]
+                        - self.mj_data.sensordata[i + self.num_motor]#获取速度的存在位置
                     )
                 )
 
     def PublishLowState(self):
-        if self.mj_data != None:
+        if self.mj_data != None:#防止空指针崩溃
             for i in range(self.num_motor):
-                self.low_state.motor_state[i].q = self.mj_data.sensordata[i]
+                #把 MuJoCo 里的数字取出来，填进 self.low_state 这个标准的宇树表格里。
+                self.low_state.motor_state[i].q = self.mj_data.sensordata[i]#当前位置
                 self.low_state.motor_state[i].dq = self.mj_data.sensordata[
                     i + self.num_motor
-                ]
+                ]#速度
                 self.low_state.motor_state[i].tau_est = self.mj_data.sensordata[
                     i + 2 * self.num_motor
-                ]
+                ]#估计力矩
 
             if self.have_frame_sensor_:
-
+                #四元数
                 self.low_state.imu_state.quaternion[0] = self.mj_data.sensordata[
                     self.dim_motor_sensor + 0
                 ]
@@ -147,7 +156,7 @@ class UnitreeSdk2Bridge:
                 self.low_state.imu_state.quaternion[3] = self.mj_data.sensordata[
                     self.dim_motor_sensor + 3
                 ]
-
+                #陀螺仪
                 self.low_state.imu_state.gyroscope[0] = self.mj_data.sensordata[
                     self.dim_motor_sensor + 4
                 ]
@@ -157,7 +166,7 @@ class UnitreeSdk2Bridge:
                 self.low_state.imu_state.gyroscope[2] = self.mj_data.sensordata[
                     self.dim_motor_sensor + 6
                 ]
-
+                #加速度计
                 self.low_state.imu_state.accelerometer[0] = self.mj_data.sensordata[
                     self.dim_motor_sensor + 7
                 ]
@@ -222,9 +231,11 @@ class UnitreeSdk2Bridge:
 
             self.low_state_puber.Write(self.low_state)
 
+    #发布通过仿真器模拟出来的绝对空间坐标
     def PublishHighState(self):
 
         if self.mj_data != None:
+            #位置
             self.high_state.position[0] = self.mj_data.sensordata[
                 self.dim_motor_sensor + 10
             ]
@@ -234,7 +245,7 @@ class UnitreeSdk2Bridge:
             self.high_state.position[2] = self.mj_data.sensordata[
                 self.dim_motor_sensor + 12
             ]
-
+            #速度
             self.high_state.velocity[0] = self.mj_data.sensordata[
                 self.dim_motor_sensor + 13
             ]
@@ -399,13 +410,13 @@ class UnitreeSdk2Bridge:
 class ElasticBand:
 
     def __init__(self):
-        self.stiffness = 200
-        self.damping = 100
-        self.point = np.array([0, 0, 3])
-        self.length = 0
+        self.stiffness = 200#刚度
+        self.damping = 100#阻尼
+        self.point = np.array([0, 0, 3])#挂载点
+        self.length = 0#原长
         self.enable = True
 
-    def Advance(self, x, dx):
+    def Advance(self, x, dx):#计算实时拉力，是一个三维力向量
         """
         Args:
           δx: desired position - current position
